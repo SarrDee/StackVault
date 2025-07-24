@@ -1,0 +1,81 @@
+;; Constants for error codes
+(define-constant ERR_ALREADY_OPEN (err u100))
+(define-constant ERR_NO_VAULT (err u101))
+(define-constant ERR_TOO_SOON (err u102))
+(define-constant ERR_ALREADY_REPAID (err u103))
+(define-constant ERR_UNDERCOLLATERALIZED (err u104))
+
+;; Collateral ratio threshold (e.g., 150%)
+(define-constant MIN_COLLATERAL_RATIO u150)
+
+;; Define the stablecoin contract principal
+(define-constant stablecoin SPXXXXXXX)
+
+;; Token trait interface
+(define-trait token-trait
+  ((transfer (uint principal principal) (response bool uint))
+   (mint (uint principal) (response bool uint))
+   (burn (uint principal) (response bool uint))
+   (get-balance (principal) (response uint uint))))
+
+;; Price oracle (returns STX price in BTC sats)
+(define-read-only (get-stx-price-in-btc)
+  (ok u2500))
+
+;; Define the vault map
+(define-map vaults
+  { borrower: principal }
+  { collateral: uint,
+    loan: uint,
+    start-height: uint,
+    duration: uint,
+    repaid: bool })
+
+;; Open a loan vault
+(define-public (open-loan (collateral uint) (loan-amount uint) (duration uint))
+  (let ((vault-exists (map-get? vaults { borrower: tx-sender })))
+    (if (is-some vault-exists)
+      ERR_ALREADY_OPEN
+      (begin
+        (try! (stx-transfer? collateral tx-sender (as-contract tx-sender)))
+        (map-set vaults 
+          { borrower: tx-sender }
+          { collateral: collateral,
+            loan: loan-amount,
+            start-height: block-height,
+            duration: duration,
+            repaid: false })
+        (ok (try! (contract-call? stablecoin mint loan-amount tx-sender)))))))
+
+;; Repay the loan and unlock collateral
+(define-public (repay-loan)
+  (match (map-get? vaults { borrower: tx-sender })
+    vault
+    (if (get repaid vault)
+        ERR_ALREADY_REPAID
+        (let ((loan (get loan vault)))
+          (try! (contract-call? stablecoin burn loan tx-sender))
+          (map-set vaults 
+            { borrower: tx-sender }
+            (merge vault { repaid: true }))
+          (ok (stx-transfer? (get collateral vault) (as-contract tx-sender) tx-sender))))
+    ERR_NO_VAULT))
+
+;; Liquidate undercollateralized or overdue loans
+(define-public (liquidate (target principal))
+  (match (map-get? vaults { borrower: target })
+    vault
+    (if (or (get repaid vault) (< block-height (+ (get start-height vault) (get duration vault))))
+        ERR_TOO_SOON
+        (let ((collateral (get collateral vault))
+              (loan (get loan vault)))
+          (match (get-stx-price-in-btc)
+            price-in-sats
+            (let ((collateral-value (* collateral price-in-sats))
+                  (required-value (/ (* loan MIN_COLLATERAL_RATIO) u100)))
+              (if (< collateral-value required-value)
+                  (begin
+                    (map-delete vaults { borrower: target })
+                    (ok (stx-transfer? collateral (as-contract tx-sender) tx-sender)))
+                  ERR_UNDERCOLLATERALIZED)))))
+    ERR_NO_VAULT))
